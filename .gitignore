@@ -3,3 +3,6 @@ __pycache__/
 .vscode/
 .tmp
 .cache
+tests/
+/*.json
+*.config.json

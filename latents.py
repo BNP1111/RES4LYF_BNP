@@ -1,1043 +1,863 @@
-import comfy.samplers
-import comfy.sample
-import comfy.sampler_helpers
-
 import torch
+import torch.nn.functional as F
+from typing import Tuple, List, Union
 import math
 
-from .noise_classes import *
 
-def initialize_or_scale(tensor, value, steps):
-    if tensor is None:
-        return torch.full((steps,), value)
+# TENSOR PROJECTION OPS
+
+def get_cosine_similarity_manual(a, b):
+    return (a * b).sum() / (torch.norm(a) * torch.norm(b))
+
+def get_cosine_similarity(a, b, mask=None, dim=0):
+    if a.ndim == 5 and b.ndim == 5 and b.shape[2] == 1:
+        b = b.expand(-1, -1, a.shape[2], -1, -1)
+        
+    if mask is not None:
+        return F.cosine_similarity((mask * a).flatten(), (mask * b).flatten(), dim=dim)
     else:
-        return value * tensor
+        return F.cosine_similarity(a.flatten(), b.flatten(), dim=dim)
     
+def get_pearson_similarity(a, b, mask=None, dim=0, norm_dim=None):
+    if a.ndim == 5 and b.ndim == 5 and b.shape[2] == 1:
+        b = b.expand(-1, -1, a.shape[2], -1, -1)
+    
+    if norm_dim is None:
+        if   a.ndim == 4:
+            norm_dim=(-2,-1)
+        elif a.ndim == 5:
+            norm_dim=(-4,-2,-1)
+    
+    a = a - a.mean(dim=norm_dim, keepdim=True)
+    b = b - b.mean(dim=norm_dim, keepdim=True)
+    
+    if mask is not None:
+        return F.cosine_similarity((mask * a).flatten(), (mask * b).flatten(), dim=dim)
+    else:
+        return F.cosine_similarity(a.flatten(), b.flatten(), dim=dim)
+    
+    
+    
+def get_collinear(x, y):
+    return get_collinear_flat(x, y).reshape_as(x)
+
+def get_orthogonal(x, y):
+    x_flat = x.reshape(x.size(0), -1).clone()
+    x_ortho_y = x_flat - get_collinear_flat(x, y)  
+    return x_ortho_y.view_as(x)
+
+def get_collinear_flat(x, y):
+
+    y_flat = y.reshape(y.size(0), -1).clone()
+    x_flat = x.reshape(x.size(0), -1).clone()
+
+    y_flat /= y_flat.norm(dim=-1, keepdim=True)
+    x_proj_y = torch.sum(x_flat * y_flat, dim=-1, keepdim=True) * y_flat
+
+    return x_proj_y
+
+
+
+def get_orthogonal_noise_from_channelwise(*refs, max_iter=500, max_score=1e-15):
+    noise, *refs = refs
+    noise_tmp = noise.clone()
+    #b,c,h,w = noise.shape
+    if (noise.ndim == 4):
+        b,ch,h,w = noise.shape
+    elif (noise.ndim == 5):
+        b,ch,t,h,w = noise.shape
+    
+    for i in range(max_iter):
+        noise_tmp = gram_schmidt_channels_optimized(noise_tmp, *refs)
+        
+        cossim_scores = []
+        for ref in refs:
+            #for c in range(noise.shape[-3]):
+            for c in range(ch):
+                cossim_scores.append(get_cosine_similarity(noise_tmp[0][c], ref[0][c]).abs())
+            cossim_scores.append(get_cosine_similarity(noise_tmp[0], ref[0]).abs())
+            
+        if max(cossim_scores) < max_score:
+            break
+    
+    return noise_tmp
+
+
+
+def gram_schmidt_channels_optimized(A, *refs):
+    if (A.ndim == 4):
+        b,c,h,w = A.shape
+    elif (A.ndim == 5):
+        b,c,t,h,w = A.shape
+
+    A_flat = A.view(b, c, -1)  
+    
+    for ref in refs:
+        ref_flat = ref.view(b, c, -1).clone()  
+
+        ref_flat /= ref_flat.norm(dim=-1, keepdim=True) 
+
+        proj_coeff = torch.sum(A_flat * ref_flat, dim=-1, keepdim=True)  
+        projection = proj_coeff * ref_flat 
+
+        A_flat -= projection
+
+    return A_flat.view_as(A)
+
+
+
+# Efficient implementation equivalent to the following:
+def attention_weights(
+    query, 
+    key, 
+    attn_mask=None
+) -> torch.Tensor:
+    L, S = query.size(-2), key.size(-2)
+    scale_factor = 1 / math.sqrt(query.size(-1))
+    attn_bias = torch.zeros(L, S, dtype=query.dtype).to(query.device)
+
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+        else:
+            attn_bias += attn_mask
+
+    attn_weight = query @ key.transpose(-2, -1) * scale_factor
+    attn_weight += attn_bias
+    attn_weight = torch.softmax(attn_weight, dim=-1)
+
+    return attn_weight
+
+
+def attention_weights_orig(q, k):
+    # implementation of in-place softmax to reduce memory req
+    scores = torch.matmul(q, k.transpose(-2, -1))
+    scores.div_(math.sqrt(q.size(-1)))
+    torch.exp(scores, out=scores)
+    summed = torch.sum(scores, dim=-1, keepdim=True)
+    scores /= summed
+    return scores.nan_to_num_(0.0, 65504., -65504.)
+
+
+# calculate slerp ratio needed to hit a target cosine similarity score
+def get_slerp_weight_for_cossim(cos_sim, target_cos):
+    # assumes unit vector matrices used for cossim
+    import math
+    c = cos_sim
+    T = target_cos
+    K = 1 - c
+
+    A = K**2 - 2 * T**2 * K
+    B = 2 * (1 - c) * (c + T**2)
+    C = c**2 - T**2
+
+    if abs(A) < 1e-8: # nearly collinear
+        return 0.5  # just mix 50:50
+
+    disc = B**2 - 4*A*C
+    if disc < 0:
+        return None  # no valid solution... blow up somewhere to get user's attention
+
+    sqrt_disc = math.sqrt(disc)
+    w1 = (-B + sqrt_disc) / (2 * A)
+    w2 = (-B - sqrt_disc) / (2 * A)
+
+    candidates = [w for w in [w1, w2] if 0 <= w <= 1]
+    if candidates:
+        return candidates[0]
+    else:
+        return max(0.0, min(1.0, w1))
+
+
+
+def get_slerp_ratio(cos_sim_A, cos_sim_B, target_cos):
+    import math
+    alpha = math.acos(cos_sim_A)
+    beta  = math.acos(cos_sim_B)
+    delta = math.acos(target_cos)
+    
+    if abs(beta - alpha) < 1e-6:
+        return 0.5
+    
+    t = (delta - alpha) / (beta - alpha)
+    t = max(0.0, min(1.0, t))
+    return t
+
+def find_slerp_ratio_grid(A: torch.Tensor, B: torch.Tensor, D: torch.Tensor, E: torch.Tensor,
+                            target_ratio: float = 1.0, num_samples: int = 100) -> float:
+    """
+    Finds the interpolation parameter t (in [0,1]) for which:
+       f(t) = cos(slerp(t, A, B), D) - target_ratio * cos(slerp(t, A, B), E)
+    is minimized in absolute value.
+    
+    Instead of requiring a sign change for bisection, we sample t values uniformly and pick the one that minimizes |f(t)|.
+    """
+    ts = torch.linspace(0.0, 1.0, steps=num_samples, device=A.device, dtype=A.dtype)
+    best_t   = 0.0
+    best_val = float('inf')
+    for t_val in ts:
+        t_tensor = torch.tensor(t_val, dtype=A.dtype, device=A.device)
+        C        = slerp_tensor(t_tensor, A, B)
+        diff     = get_pearson_similarity(C, D) - target_ratio * get_pearson_similarity(C, E)
+        if abs(diff) < best_val:
+            best_val = abs(diff)
+            best_t   = t_val
+    return best_t
+
+
+
+def compute_slerp_ratio_for_target(A: torch.Tensor, B: torch.Tensor, D: torch.Tensor, target: float) -> float:
+    """
+    Given three unit vectors A, B, and D (all assumed to be coplanar)
+    and a target cosine similarity (target) for the slerp result C with D,
+    compute the interpolation parameter t such that:
+        C = slerp(t, A, B)
+        and cos(C, D) ≈ target.
+
+    Args:
+        A: Tensor of shape (D,), starting vector.
+        B: Tensor of shape (D,), ending vector.
+        D: Tensor of shape (D,), the reference vector.
+        target: Desired cosine similarity between C and D.
+
+    Returns:
+        t: A float between 0 and 1.
+    """
+    A = A / (A.norm() + 1e-8)
+    B = B / (B.norm() + 1e-8)
+    D = D / (D.norm() + 1e-8)
+    
+    alpha = math.acos(max(-1.0, min(1.0, float(torch.dot(D, A))))) # angel between D and A
+    beta  = math.acos(max(-1.0, min(1.0, float(torch.dot(D, B))))) # angle between D and B
+    
+    delta = math.acos(max(-1.0, min(1.0, target))) # target cosine similarity... angle etc...
+    
+    if abs(beta - alpha) < 1e-6:
+        return 0.5
+    
+    t = (delta - alpha) / (beta - alpha)
+    t = max(0.0, min(1.0, t))
+    return t
+
+
+
+# TENSOR NORMALIZATION OPS
+
+def normalize_zscore(x, channelwise=False, inplace=False):
+    if inplace:
+        if channelwise:
+            return x.sub_(x.mean(dim=(-2,-1), keepdim=True)).div_(x.std(dim=(-2,-1), keepdim=True))
+        else:
+            return x.sub_(x.mean()).div_(x.std())
+    else:
+        if channelwise:
+            return (x - x.mean(dim=(-2,-1), keepdim=True) / x.std(dim=(-2,-1), keepdim=True))
+        else:
+            return (x - x.mean()) / x.std()
+
 def latent_normalize_channels(x):
-    mean = x.mean(dim=(2, 3), keepdim=True)
-    std  = x.std (dim=(2, 3), keepdim=True)
+    mean = x.mean(dim=(-2, -1), keepdim=True)
+    std  = x.std (dim=(-2, -1), keepdim=True)
     return  (x - mean) / std
 
 def latent_stdize_channels(x):
-    std  = x.std (dim=(2, 3), keepdim=True)
+    std  = x.std (dim=(-2, -1), keepdim=True)
     return  x / std
 
 def latent_meancenter_channels(x):
-    mean = x.mean(dim=(2, 3), keepdim=True)
+    mean = x.mean(dim=(-2, -1), keepdim=True)
     return  x - mean
 
-class set_precision:
-    def __init__(self):
-        pass
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                    "latent_image": ("LATENT", ),      
-                    "precision": (["16", "32", "64"], ),
-                     },
-                }
 
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("passthrough",)
-    CATEGORY = "sampling/custom_sampling/"
 
-    FUNCTION = "main"
+# TENSOR INTERPOLATION OPS
 
-    def main(self, precision="32", latent_image=None):
-        match precision:
-            case "16":
-                torch.set_default_dtype(torch.float16)
-                x = latent_image["samples"].to(torch.float16)
-            case "32":
-                torch.set_default_dtype(torch.float32)
-                x = latent_image["samples"].to(torch.float32)
-            case "64":
-                torch.set_default_dtype(torch.float64)
-                x = latent_image["samples"].to(torch.float64)
-        return ({"samples": x}, )
+def lagrange_interpolation(x_values, y_values, x_new):
+
+    if not isinstance(x_values, torch.Tensor):
+        x_values = torch.tensor(x_values, dtype=torch.get_default_dtype())
+    if x_values.ndim != 1:
+        raise ValueError("x_values must be a 1D tensor or a list of scalars.")
+
+    if not isinstance(x_new, torch.Tensor):
+        x_new = torch.tensor(x_new, dtype=x_values.dtype, device=x_values.device)
+    if x_new.ndim == 0:
+        x_new = x_new.unsqueeze(0)
+
+    if isinstance(y_values, list):
+        y_values = torch.stack(y_values, dim=0)
+    if y_values.ndim < 1:
+        raise ValueError("y_values must have at least one dimension (the sample dimension).")
+
+    n = x_values.shape[0]
+    if y_values.shape[0] != n:
+        raise ValueError(f"Mismatch: x_values has length {n} but y_values has {y_values.shape[0]} samples.")
+
+    m = x_new.shape[0]
+    result_shape = (m,) + y_values.shape[1:]
+    result = torch.zeros(result_shape, dtype=y_values.dtype, device=y_values.device)
+
+    for i in range(n):
+        Li = torch.ones_like(x_new, dtype=y_values.dtype, device=y_values.device)
+        xi = x_values[i]
+        for j in range(n):
+            if i == j:
+                continue
+            xj = x_values[j]
+            Li = Li * ((x_new - xj) / (xi - xj))
+        extra_dims = (1,) * (y_values.ndim - 1)
+        Li = Li.view(m, *extra_dims)
+        result = result + Li * y_values[i]
+
+    return result
+
+def line_intersection(a: torch.Tensor, d1: torch.Tensor, b: torch.Tensor, d2: torch.Tensor, eps=1e-8) -> torch.Tensor:
+    """
+    Computes the intersection (or closest point average) of two lines in R^D.
     
-class latent_to_cuda:
-    def __init__(self):
-        pass
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                    "latent": ("LATENT", ),      
-                    "to_cuda": ("BOOLEAN", {"default": True}),
-                     },
-                }
-
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("passthrough",)
-    CATEGORY = "sampling/custom_sampling/"
-
-    FUNCTION = "main"
-
-    def main(self, latent, to_cuda):
-        match to_cuda:
-            case "True":
-                latent = latent.to('cuda')
-            case "False":
-                latent = latent.to('cpu')
-        return (latent,)
-
-class latent_batch:
-    def __init__(self):
-        pass
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                    "latent": ("LATENT", ),      
-                    "batch_size": ("INT", {"default": 0, "min": -10000, "max": 10000}),
-                     },
-                }
-
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("latent_batch",)
-    CATEGORY = "sampling/custom_sampling/"
-
-    FUNCTION = "main"
-
-    def main(self, latent, batch_size):
-        latent = latent["samples"]
-        b, c, h, w = latent.shape
-        batch_latents = torch.zeros([batch_size, 4, h, w], device=latent.device)
-        for i in range(batch_size):
-            batch_latents[i] = latent
-        return ({"samples": batch_latents}, )
-
-class LatentPhaseMagnitude:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "latent_0_batch": ("LATENT",),
-                "latent_1_batch": ("LATENT",),
-
-                "phase_mix_power": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "magnitude_mix_power": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-
-                "phase_luminosity": ("FLOAT", {"default": 0.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "phase_cyan_red": ("FLOAT", {"default": 0.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "phase_lime_purple": ("FLOAT", {"default": 0.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "phase_pattern_structure": ("FLOAT", {"default": 0.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-
-                "magnitude_luminosity": ("FLOAT", {"default": 0.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "magnitude_cyan_red": ("FLOAT", {"default": 0.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "magnitude_lime_purple": ("FLOAT", {"default": 0.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "magnitude_pattern_structure": ("FLOAT", {"default": 0.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-
-                "latent_0_normal": ("BOOLEAN", {"default": True}),
-                "latent_1_normal": ("BOOLEAN", {"default": True}),
-                "latent_out_normal": ("BOOLEAN", {"default": True}),
-                "latent_0_stdize": ("BOOLEAN", {"default": True}),
-                "latent_1_stdize": ("BOOLEAN", {"default": True}),
-                "latent_out_stdize": ("BOOLEAN", {"default": True}),
-                "latent_0_meancenter": ("BOOLEAN", {"default": True}),
-                "latent_1_meancenter": ("BOOLEAN", {"default": True}),
-                "latent_out_meancenter": ("BOOLEAN", {"default": True}),
-            },
-            "optional": {
-                "phase_mix_powers": ("SIGMAS", ),
-                "magnitude_mix_powers": ("SIGMAS", ),
-
-                "phase_luminositys": ("SIGMAS", ),
-                "phase_cyan_reds": ("SIGMAS", ),
-                "phase_lime_purples": ("SIGMAS", ),
-                "phase_pattern_structures": ("SIGMAS", ),
-
-                "magnitude_luminositys": ("SIGMAS", ),
-                "magnitude_cyan_reds": ("SIGMAS", ),
-                "magnitude_lime_purples": ("SIGMAS", ),
-                "magnitude_pattern_structures": ("SIGMAS", ),
-            }
-        }
-
-    RETURN_TYPES = ("LATENT",)
-    FUNCTION = "main"
-    CATEGORY = "sampling/custom_sampling/samplers"
-
-    @staticmethod
-    def latent_repeat(latent, batch_size):
-        b, c, h, w = latent.shape
-        batch_latents = torch.zeros((batch_size, c, h, w), dtype=latent.dtype, layout=latent.layout, device=latent.device)
-        for i in range(batch_size):
-            batch_latents[i] = latent
-        return batch_latents
-
-    @staticmethod
-    def mix_latent_phase_magnitude(latent_0, latent_1, power_phase, power_magnitude,
-                                    phase_luminosity, phase_cyan_red, phase_lime_purple, phase_pattern_structure,
-                                    magnitude_luminosity, magnitude_cyan_red, magnitude_lime_purple, magnitude_pattern_structure
-                                    ):
-        dtype = torch.promote_types(latent_0.dtype, latent_1.dtype)
-        # big accuracy problems with fp32 FFT! let's avoid that
-        latent_0 = latent_0.double()
-        latent_1 = latent_1.double()
-
-        latent_0_fft = torch.fft.fft2(latent_0)
-        latent_1_fft = torch.fft.fft2(latent_1)
-
-        latent_0_phase = torch.angle(latent_0_fft)
-        latent_1_phase = torch.angle(latent_1_fft)
-        latent_0_magnitude = torch.abs(latent_0_fft)
-        latent_1_magnitude = torch.abs(latent_1_fft)
-
-        # DC corruption...? handle separately??
-        #dc_index = (0, 0)
-        #dc_0 = latent_0_fft[:, :, dc_index[0], dc_index[1]]
-        #dc_1 = latent_1_fft[:, :, dc_index[0], dc_index[1]]
-        #mixed_dc = dc_0 * 0.5 + dc_1 * 0.5
-        #mixed_dc = dc_0 * (1 - phase_weight) + dc_1 * phase_weight
-
-        # create complex FFT using a weighted mix of phases
-        chan_weights_phase     = [w for w in [phase_luminosity,     phase_cyan_red,     phase_lime_purple,     phase_pattern_structure    ]]
-        chan_weights_magnitude = [w for w in [magnitude_luminosity, magnitude_cyan_red, magnitude_lime_purple, magnitude_pattern_structure]]
-        mixed_phase     = torch.zeros_like(latent_0, dtype=latent_0.dtype, layout=latent_0.layout, device=latent_0.device)
-        mixed_magnitude = torch.zeros_like(latent_0, dtype=latent_0.dtype, layout=latent_0.layout, device=latent_0.device)
-
-        for i in range(4):
-            mixed_phase[:, i]     = ( (latent_0_phase[:,i] * (1-chan_weights_phase[i])) ** power_phase + (latent_1_phase[:,i] * chan_weights_phase[i]) ** power_phase) ** (1/power_phase)
-            mixed_magnitude[:, i]     = ( (latent_0_magnitude[:,i] * (1-chan_weights_magnitude[i])) ** power_magnitude + (latent_1_magnitude[:,i] * chan_weights_magnitude[i]) ** power_magnitude) ** (1/power_magnitude)
-
-        new_fft = mixed_magnitude * torch.exp(1j * mixed_phase)
-
-        #new_fft[:, :, dc_index[0], dc_index[1]] = mixed_dc
-
-        # inverse FFT to convert back to spatial domain
-        mixed_phase_magnitude = torch.fft.ifft2(new_fft).real
-
-        return mixed_phase_magnitude.to(dtype)
+    The first line is defined by:  L1: x = a + t * d1
+    The second line is defined by: L2: x = b + s * d2
     
-    def main(self, #batch_size, latent_1_repeat,
-             latent_0_batch,  latent_1_batch, latent_0_normal, latent_1_normal, latent_out_normal,
-             latent_0_stdize, latent_1_stdize, latent_out_stdize, 
-             latent_0_meancenter, latent_1_meancenter, latent_out_meancenter, 
-             phase_mix_power, magnitude_mix_power, 
-             phase_luminosity,           phase_cyan_red,           phase_lime_purple,           phase_pattern_structure, 
-             magnitude_luminosity,       magnitude_cyan_red,       magnitude_lime_purple,       magnitude_pattern_structure, 
-             phase_mix_powers=None,      magnitude_mix_powers=None,
-             phase_luminositys=None,     phase_cyan_reds=None,     phase_lime_purples=None,     phase_pattern_structures=None,
-             magnitude_luminositys=None, magnitude_cyan_reds=None, magnitude_lime_purples=None, magnitude_pattern_structures=None
-             ):
-        latent_0_batch = latent_0_batch["samples"].double()
-        latent_1_batch = latent_1_batch["samples"].double().to(latent_0_batch.device)
-
-        #if batch_size == 0:
-        batch_size = latent_0_batch.shape[0]
-        if latent_1_batch.shape[0] == 1:
-            latent_1_batch = self.latent_repeat(latent_1_batch, batch_size)
-
-
-        magnitude_mix_powers         = initialize_or_scale(magnitude_mix_powers,         magnitude_mix_power,         batch_size)
-        phase_mix_powers             = initialize_or_scale(phase_mix_powers,             phase_mix_power,            batch_size)
-
-        phase_luminositys            = initialize_or_scale(phase_luminositys,            phase_luminosity,            batch_size)
-        phase_cyan_reds              = initialize_or_scale(phase_cyan_reds,              phase_cyan_red,              batch_size)
-        phase_lime_purples           = initialize_or_scale(phase_lime_purples,           phase_lime_purple,           batch_size)
-        phase_pattern_structures     = initialize_or_scale(phase_pattern_structures,     phase_pattern_structure,     batch_size)
-
-        magnitude_luminositys        = initialize_or_scale(magnitude_luminositys,        magnitude_luminosity,        batch_size)
-        magnitude_cyan_reds          = initialize_or_scale(magnitude_cyan_reds,          magnitude_cyan_red,          batch_size)
-        magnitude_lime_purples       = initialize_or_scale(magnitude_lime_purples,       magnitude_lime_purple,       batch_size)
-        magnitude_pattern_structures = initialize_or_scale(magnitude_pattern_structures, magnitude_pattern_structure, batch_size)    
-
-        mixed_phase_magnitude_batch = torch.zeros(latent_0_batch.shape, device=latent_0_batch.device)
-
-        if latent_0_normal == True:
-            latent_0_batch = latent_normalize_channels(latent_0_batch)
-        if latent_1_normal == True:
-            latent_1_batch = latent_normalize_channels(latent_1_batch)
-        if latent_0_meancenter == True:
-            latent_0_batch = latent_meancenter_channels(latent_0_batch)
-        if latent_1_meancenter == True:
-            latent_1_batch = latent_meancenter_channels(latent_1_batch)
-        if latent_0_stdize == True:
-            latent_0_batch = latent_stdize_channels(latent_0_batch)
-        if latent_1_stdize == True:
-            latent_1_batch = latent_stdize_channels(latent_1_batch)
- 
-        for i in range(batch_size):
-            mixed_phase_magnitude = self.mix_latent_phase_magnitude(latent_0_batch[i:i+1], latent_1_batch[i:i+1], phase_mix_powers[i].item(), magnitude_mix_powers[i].item(),
-                                                    phase_luminositys[i].item(), phase_cyan_reds[i].item(),phase_lime_purples[i].item(),phase_pattern_structures[i].item(),
-                                                    magnitude_luminositys[i].item(), magnitude_cyan_reds[i].item(),magnitude_lime_purples[i].item(),magnitude_pattern_structures[i].item()
-                                                    )
-            if latent_out_normal == True:
-                mixed_phase_magnitude = latent_normalize_channels(mixed_phase_magnitude)
-            if latent_out_stdize == True:
-                mixed_phase_magnitude = latent_stdize_channels(mixed_phase_magnitude)
-            if latent_out_meancenter == True:
-                mixed_phase_magnitude = latent_meancenter_channels(mixed_phase_magnitude)                                
-
-            mixed_phase_magnitude_batch[i, :, :, :] = mixed_phase_magnitude
-
-        return ({"samples": mixed_phase_magnitude_batch}, )
-
-class LatentPhaseMagnitudeMultiply:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "latent_0_batch": ("LATENT",),
-
-                "phase_luminosity": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "phase_cyan_red": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "phase_lime_purple": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "phase_pattern_structure": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-
-                "magnitude_luminosity": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "magnitude_cyan_red": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "magnitude_lime_purple": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "magnitude_pattern_structure": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-
-                "latent_0_normal": ("BOOLEAN", {"default": False}),
-                "latent_out_normal": ("BOOLEAN", {"default": False}),
-            },
-            "optional": {
-                "phase_luminositys": ("SIGMAS", ),
-                "phase_cyan_reds": ("SIGMAS", ),
-                "phase_lime_purples": ("SIGMAS", ),
-                "phase_pattern_structures": ("SIGMAS", ),
-
-                "magnitude_luminositys": ("SIGMAS", ),
-                "magnitude_cyan_reds": ("SIGMAS", ),
-                "magnitude_lime_purples": ("SIGMAS", ),
-                "magnitude_pattern_structures": ("SIGMAS", ),
-            }
-        }
-
-    RETURN_TYPES = ("LATENT",)
-    FUNCTION = "main"
-    CATEGORY = "sampling/custom_sampling/samplers"
-
-    @staticmethod
-    def latent_repeat(latent, batch_size):
-        b, c, h, w = latent.shape
-        batch_latents = torch.zeros((batch_size, c, h, w), dtype=latent.dtype, layout=latent.layout, device=latent.device)
-        for i in range(batch_size):
-            batch_latents[i] = latent
-        return batch_latents
-
-    @staticmethod
-    def mix_latent_phase_magnitude(latent_0,  
-                                    phase_luminosity, phase_cyan_red, phase_lime_purple, phase_pattern_structure,
-                                    magnitude_luminosity, magnitude_cyan_red, magnitude_lime_purple, magnitude_pattern_structure
-                                    ):
-        dtype = latent_0.dtype
-        # avoid big accuracy problems with fp32 FFT!
-        latent_0 = latent_0.double()
-
-        latent_0_fft = torch.fft.fft2(latent_0)
-
-        latent_0_phase = torch.angle(latent_0_fft)
-        latent_0_magnitude = torch.abs(latent_0_fft)
-
-        # create new complex FFT using weighted mix of phases
-        chan_weights_phase     = [w for w in [phase_luminosity,     phase_cyan_red,     phase_lime_purple,     phase_pattern_structure    ]]
-        chan_weights_magnitude = [ w for w in [magnitude_luminosity, magnitude_cyan_red, magnitude_lime_purple, magnitude_pattern_structure]]
-        mixed_phase     = torch.zeros_like(latent_0, dtype=latent_0.dtype, layout=latent_0.layout, device=latent_0.device)
-        mixed_magnitude = torch.zeros_like(latent_0, dtype=latent_0.dtype, layout=latent_0.layout, device=latent_0.device)
-
-        for i in range(4):
-            mixed_phase[:, i]     = latent_0_phase[:,i]     * chan_weights_phase[i]
-            mixed_magnitude[:, i] = latent_0_magnitude[:,i] * chan_weights_magnitude[i]
-
-        new_fft = mixed_magnitude * torch.exp(1j * mixed_phase)
-        
-        # inverse FFT to convert back to spatial domain
-        mixed_phase_magnitude = torch.fft.ifft2(new_fft).real
-
-        return mixed_phase_magnitude.to(dtype)
+    If the lines do not exactly intersect, this function returns the average of the closest points.
     
-    def main(self,
-             latent_0_batch, latent_0_normal, latent_out_normal,
-             phase_luminosity,           phase_cyan_red,           phase_lime_purple,           phase_pattern_structure, 
-             magnitude_luminosity,       magnitude_cyan_red,       magnitude_lime_purple,       magnitude_pattern_structure, 
-             phase_luminositys=None,     phase_cyan_reds=None,     phase_lime_purples=None,     phase_pattern_structures=None,
-             magnitude_luminositys=None, magnitude_cyan_reds=None, magnitude_lime_purples=None, magnitude_pattern_structures=None
-             ):
-        latent_0_batch = latent_0_batch["samples"].double()
-
-        batch_size = latent_0_batch.shape[0]
-
-        phase_luminositys            = initialize_or_scale(phase_luminositys,            phase_luminosity,            batch_size)
-        phase_cyan_reds              = initialize_or_scale(phase_cyan_reds,              phase_cyan_red,              batch_size)
-        phase_lime_purples           = initialize_or_scale(phase_lime_purples,           phase_lime_purple,           batch_size)
-        phase_pattern_structures     = initialize_or_scale(phase_pattern_structures,     phase_pattern_structure,     batch_size)
-
-        magnitude_luminositys        = initialize_or_scale(magnitude_luminositys,        magnitude_luminosity,        batch_size)
-        magnitude_cyan_reds          = initialize_or_scale(magnitude_cyan_reds,          magnitude_cyan_red,          batch_size)
-        magnitude_lime_purples       = initialize_or_scale(magnitude_lime_purples,       magnitude_lime_purple,       batch_size)
-        magnitude_pattern_structures = initialize_or_scale(magnitude_pattern_structures, magnitude_pattern_structure, batch_size)    
-
-        mixed_phase_magnitude_batch = torch.zeros(latent_0_batch.shape, device=latent_0_batch.device)
-
-        if latent_0_normal == True:
-            latent_0_batch = latent_normalize_channels(latent_0_batch)
- 
-        for i in range(batch_size):
-            mixed_phase_magnitude = self.mix_latent_phase_magnitude(latent_0_batch[i:i+1],
-                                                    phase_luminositys[i].item(), phase_cyan_reds[i].item(),phase_lime_purples[i].item(),phase_pattern_structures[i].item(),
-                                                    magnitude_luminositys[i].item(), magnitude_cyan_reds[i].item(),magnitude_lime_purples[i].item(),magnitude_pattern_structures[i].item()
-                                                    )
-            if latent_out_normal == True:
-                mixed_phase_magnitude = latent_normalize_channels(mixed_phase_magnitude)
-
-            mixed_phase_magnitude_batch[i, :, :, :] = mixed_phase_magnitude
-
-        return ({"samples": mixed_phase_magnitude_batch}, )
-
-
-
-
-
-
-class LatentPhaseMagnitudeOffset:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "latent_0_batch": ("LATENT",),
-
-                "phase_luminosity": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "phase_cyan_red": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "phase_lime_purple": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "phase_pattern_structure": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-
-                "magnitude_luminosity": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "magnitude_cyan_red": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "magnitude_lime_purple": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "magnitude_pattern_structure": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-
-                "latent_0_normal": ("BOOLEAN", {"default": False}),
-                "latent_out_normal": ("BOOLEAN", {"default": False}),
-            },
-            "optional": {
-                "phase_luminositys": ("SIGMAS", ),
-                "phase_cyan_reds": ("SIGMAS", ),
-                "phase_lime_purples": ("SIGMAS", ),
-                "phase_pattern_structures": ("SIGMAS", ),
-
-                "magnitude_luminositys": ("SIGMAS", ),
-                "magnitude_cyan_reds": ("SIGMAS", ),
-                "magnitude_lime_purples": ("SIGMAS", ),
-                "magnitude_pattern_structures": ("SIGMAS", ),
-            }
-        }
-
-    RETURN_TYPES = ("LATENT",)
-    FUNCTION = "main"
-    CATEGORY = "sampling/custom_sampling/samplers"
-
-    @staticmethod
-    def latent_repeat(latent, batch_size):
-        b, c, h, w = latent.shape
-        batch_latents = torch.zeros((batch_size, c, h, w), dtype=latent.dtype, layout=latent.layout, device=latent.device)
-        for i in range(batch_size):
-            batch_latents[i] = latent
-        return batch_latents
-
-    @staticmethod
-    def mix_latent_phase_magnitude(latent_0,  
-                                    phase_luminosity, phase_cyan_red, phase_lime_purple, phase_pattern_structure,
-                                    magnitude_luminosity, magnitude_cyan_red, magnitude_lime_purple, magnitude_pattern_structure
-                                    ):
-        dtype = latent_0.dtype
-        # avoid big accuracy problems with fp32 FFT!
-        latent_0 = latent_0.double()
-
-        latent_0_fft = torch.fft.fft2(latent_0)
-
-        latent_0_phase = torch.angle(latent_0_fft)
-        latent_0_magnitude = torch.abs(latent_0_fft)
-
-        # create new complex FFT using a weighted mix of phases
-        chan_weights_phase     = [w for w in [phase_luminosity,     phase_cyan_red,     phase_lime_purple,     phase_pattern_structure    ]]
-        chan_weights_magnitude = [ w for w in [magnitude_luminosity, magnitude_cyan_red, magnitude_lime_purple, magnitude_pattern_structure]]
-        mixed_phase     = torch.zeros_like(latent_0, dtype=latent_0.dtype, layout=latent_0.layout, device=latent_0.device)
-        mixed_magnitude = torch.zeros_like(latent_0, dtype=latent_0.dtype, layout=latent_0.layout, device=latent_0.device)
-
-        for i in range(4):
-            mixed_phase[:, i]     = latent_0_phase[:,i]     + chan_weights_phase[i]
-            mixed_magnitude[:, i] = latent_0_magnitude[:,i] + chan_weights_magnitude[i]
-
-        new_fft = mixed_magnitude * torch.exp(1j * mixed_phase)
-        
-        # inverse FFT to convert back to spatial domain
-        mixed_phase_magnitude = torch.fft.ifft2(new_fft).real
-
-        return mixed_phase_magnitude.to(dtype)
+    a, d1, b, d2: Tensors of shape (D,) or with an extra batch dimension (B, D).
+    Returns: Tensor of shape (D,) or (B, D) representing the intersection (or midpoint of closest approach).
+    """
+    # Compute dot products
+    d1d1 = (d1 * d1).sum(dim=-1, keepdim=True)  # shape (B,1) or (1,)
+    d2d2 = (d2 * d2).sum(dim=-1, keepdim=True)
+    d1d2 = (d1 * d2).sum(dim=-1, keepdim=True)
     
-    def main(self,
-             latent_0_batch, latent_0_normal, latent_out_normal,
-             phase_luminosity,           phase_cyan_red,           phase_lime_purple,           phase_pattern_structure, 
-             magnitude_luminosity,       magnitude_cyan_red,       magnitude_lime_purple,       magnitude_pattern_structure, 
-             phase_luminositys=None,     phase_cyan_reds=None,     phase_lime_purples=None,     phase_pattern_structures=None,
-             magnitude_luminositys=None, magnitude_cyan_reds=None, magnitude_lime_purples=None, magnitude_pattern_structures=None
-             ):
-        latent_0_batch = latent_0_batch["samples"].double()
-
-        batch_size = latent_0_batch.shape[0]
-
-        phase_luminositys            = initialize_or_scale(phase_luminositys,            phase_luminosity,            batch_size)
-        phase_cyan_reds              = initialize_or_scale(phase_cyan_reds,              phase_cyan_red,              batch_size)
-        phase_lime_purples           = initialize_or_scale(phase_lime_purples,           phase_lime_purple,           batch_size)
-        phase_pattern_structures     = initialize_or_scale(phase_pattern_structures,     phase_pattern_structure,     batch_size)
-
-        magnitude_luminositys        = initialize_or_scale(magnitude_luminositys,        magnitude_luminosity,        batch_size)
-        magnitude_cyan_reds          = initialize_or_scale(magnitude_cyan_reds,          magnitude_cyan_red,          batch_size)
-        magnitude_lime_purples       = initialize_or_scale(magnitude_lime_purples,       magnitude_lime_purple,       batch_size)
-        magnitude_pattern_structures = initialize_or_scale(magnitude_pattern_structures, magnitude_pattern_structure, batch_size)    
-
-        mixed_phase_magnitude_batch = torch.zeros(latent_0_batch.shape, device=latent_0_batch.device)
-
-        if latent_0_normal == True:
-            latent_0_batch = latent_normalize_channels(latent_0_batch)
- 
-        for i in range(batch_size):
-            mixed_phase_magnitude = self.mix_latent_phase_magnitude(latent_0_batch[i:i+1],
-                                                    phase_luminositys[i].item(), phase_cyan_reds[i].item(),phase_lime_purples[i].item(),phase_pattern_structures[i].item(),
-                                                    magnitude_luminositys[i].item(), magnitude_cyan_reds[i].item(),magnitude_lime_purples[i].item(),magnitude_pattern_structures[i].item()
-                                                    )
-            if latent_out_normal == True:
-                mixed_phase_magnitude = latent_normalize_channels(mixed_phase_magnitude)
-
-            mixed_phase_magnitude_batch[i, :, :, :] = mixed_phase_magnitude
-
-        return ({"samples": mixed_phase_magnitude_batch}, )
-
-
-
-
-
-class LatentPhaseMagnitudePower:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "latent_0_batch": ("LATENT",),
-
-                "phase_luminosity": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "phase_cyan_red": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "phase_lime_purple": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "phase_pattern_structure": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-
-                "magnitude_luminosity": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "magnitude_cyan_red": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "magnitude_lime_purple": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "magnitude_pattern_structure": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-
-                "latent_0_normal": ("BOOLEAN", {"default": False}),
-                "latent_out_normal": ("BOOLEAN", {"default": False}),
-            },
-            "optional": {
-                "phase_luminositys": ("SIGMAS", ),
-                "phase_cyan_reds": ("SIGMAS", ),
-                "phase_lime_purples": ("SIGMAS", ),
-                "phase_pattern_structures": ("SIGMAS", ),
-
-                "magnitude_luminositys": ("SIGMAS", ),
-                "magnitude_cyan_reds": ("SIGMAS", ),
-                "magnitude_lime_purples": ("SIGMAS", ),
-                "magnitude_pattern_structures": ("SIGMAS", ),
-            }
-        }
-
-    RETURN_TYPES = ("LATENT",)
-    FUNCTION = "main"
-    CATEGORY = "sampling/custom_sampling/samplers"
-
-    @staticmethod
-    def latent_repeat(latent, batch_size):
-        b, c, h, w = latent.shape
-        batch_latents = torch.zeros((batch_size, c, h, w), dtype=latent.dtype, layout=latent.layout, device=latent.device)
-        for i in range(batch_size):
-            batch_latents[i] = latent
-        return batch_latents
-
-    @staticmethod
-    def mix_latent_phase_magnitude(latent_0,  
-                                    phase_luminosity, phase_cyan_red, phase_lime_purple, phase_pattern_structure,
-                                    magnitude_luminosity, magnitude_cyan_red, magnitude_lime_purple, magnitude_pattern_structure
-                                    ):
-        dtype = latent_0.dtype
-        # avoid big accuracy problems with fp32 FFT!
-        latent_0 = latent_0.double()
-
-        latent_0_fft = torch.fft.fft2(latent_0)
-
-        latent_0_phase = torch.angle(latent_0_fft)
-        latent_0_magnitude = torch.abs(latent_0_fft)
-
-        # create new complex FFT using a weighted mix of phases
-        chan_weights_phase     = [w for w in [phase_luminosity,     phase_cyan_red,     phase_lime_purple,     phase_pattern_structure    ]]
-        chan_weights_magnitude = [ w for w in [magnitude_luminosity, magnitude_cyan_red, magnitude_lime_purple, magnitude_pattern_structure]]
-        mixed_phase     = torch.zeros_like(latent_0, dtype=latent_0.dtype, layout=latent_0.layout, device=latent_0.device)
-        mixed_magnitude = torch.zeros_like(latent_0, dtype=latent_0.dtype, layout=latent_0.layout, device=latent_0.device)
-
-        for i in range(4):
-            mixed_phase[:, i]     = latent_0_phase[:,i]     ** chan_weights_phase[i]
-            mixed_magnitude[:, i] = latent_0_magnitude[:,i] ** chan_weights_magnitude[i]
-
-        new_fft = mixed_magnitude * torch.exp(1j * mixed_phase)
-        
-        # inverse FFT to convert back to spatial domain
-        mixed_phase_magnitude = torch.fft.ifft2(new_fft).real
-
-        return mixed_phase_magnitude.to(dtype)
+    r = b - a  # shape (B, D) or (D,)
+    r_d1 = (r * d1).sum(dim=-1, keepdim=True)
+    r_d2 = (r * d2).sum(dim=-1, keepdim=True)
     
-    def main(self,
-             latent_0_batch, latent_0_normal, latent_out_normal,
-             phase_luminosity,           phase_cyan_red,           phase_lime_purple,           phase_pattern_structure, 
-             magnitude_luminosity,       magnitude_cyan_red,       magnitude_lime_purple,       magnitude_pattern_structure, 
-             phase_luminositys=None,     phase_cyan_reds=None,     phase_lime_purples=None,     phase_pattern_structures=None,
-             magnitude_luminositys=None, magnitude_cyan_reds=None, magnitude_lime_purples=None, magnitude_pattern_structures=None
-             ):
-        latent_0_batch = latent_0_batch["samples"].double()
-
-        batch_size = latent_0_batch.shape[0]
-
-        phase_luminositys            = initialize_or_scale(phase_luminositys,            phase_luminosity,            batch_size)
-        phase_cyan_reds              = initialize_or_scale(phase_cyan_reds,              phase_cyan_red,              batch_size)
-        phase_lime_purples           = initialize_or_scale(phase_lime_purples,           phase_lime_purple,           batch_size)
-        phase_pattern_structures     = initialize_or_scale(phase_pattern_structures,     phase_pattern_structure,     batch_size)
-
-        magnitude_luminositys        = initialize_or_scale(magnitude_luminositys,        magnitude_luminosity,        batch_size)
-        magnitude_cyan_reds          = initialize_or_scale(magnitude_cyan_reds,          magnitude_cyan_red,          batch_size)
-        magnitude_lime_purples       = initialize_or_scale(magnitude_lime_purples,       magnitude_lime_purple,       batch_size)
-        magnitude_pattern_structures = initialize_or_scale(magnitude_pattern_structures, magnitude_pattern_structure, batch_size)    
-
-        mixed_phase_magnitude_batch = torch.zeros(latent_0_batch.shape, device=latent_0_batch.device)
-
-        if latent_0_normal == True:
-            latent_0_batch = latent_normalize_channels(latent_0_batch)
- 
-        for i in range(batch_size):
-            mixed_phase_magnitude = self.mix_latent_phase_magnitude(latent_0_batch[i:i+1],
-                                                    phase_luminositys[i].item(), phase_cyan_reds[i].item(),phase_lime_purples[i].item(),phase_pattern_structures[i].item(),
-                                                    magnitude_luminositys[i].item(), magnitude_cyan_reds[i].item(),magnitude_lime_purples[i].item(),magnitude_pattern_structures[i].item()
-                                                    )
-            if latent_out_normal == True:
-                mixed_phase_magnitude = latent_normalize_channels(mixed_phase_magnitude)
-
-            mixed_phase_magnitude_batch[i, :, :, :] = mixed_phase_magnitude
-
-        return ({"samples": mixed_phase_magnitude_batch}, )
-
-class EmptyLatentImage64:
-    def __init__(self):
-        self.device = comfy.model_management.intermediate_device()
-
-    @classmethod
-    def INPUT_TYPES(s):
-        return {"required": { "width": ("INT", {"default": 1024, "min": 16, "max": MAX_RESOLUTION, "step": 8}),
-                              "height": ("INT", {"default": 1024, "min": 16, "max": MAX_RESOLUTION, "step": 8}),
-                              "batch_size": ("INT", {"default": 1, "min": 1, "max": 4096})}}
-    RETURN_TYPES = ("LATENT",)
-    FUNCTION = "generate"
-
-    CATEGORY = "latent"
-
-    def generate(self, width, height, batch_size=1):
-        latent = torch.zeros([batch_size, 4, height // 8, width // 8], dtype=torch.float64, device=self.device)
-        return ({"samples":latent}, )
-
-"""class CheckpointLoader32:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {"required": { "config_name": (folder_paths.get_filename_list("configs"), ),
-                              "ckpt_name": (folder_paths.get_filename_list("checkpoints"), )}}
-    RETURN_TYPES = ("MODEL", "CLIP", "VAE")
-    FUNCTION = "load_checkpoint"
-
-    CATEGORY = "advanced/loaders"
-
-    def load_checkpoint(self, config_name, ckpt_name, output_vae=True, output_clip=True):
-        #torch.set_default_dtype(torch.float64)
-        config_path = folder_paths.get_full_path("configs", config_name)
-        ckpt_path = folder_paths.get_full_path("checkpoints", ckpt_name)
-        return comfy.sd.load_checkpoint(config_path, ckpt_path, output_vae=True, output_clip=True, embedding_directory=folder_paths.get_folder_paths("embeddings"))"""
-
-MAX_RESOLUTION=8192
-
-class LatentNoiseBatch_perlin:
-    def __init__(self):
-        pass
-
-    @classmethod
-    def INPUT_TYPES(s): 
-        return {"required": {
-            "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-            "width": ("INT", {"default": 1024, "min": 8, "max": MAX_RESOLUTION, "step": 8}),
-            "height": ("INT", {"default": 1024, "min": 8, "max": MAX_RESOLUTION, "step": 8}),
-            "batch_size": ("INT", {"default": 1, "min": 1, "max": 256}),
-            "detail_level": ("FLOAT", {"default": 0, "min": -1, "max": 1.0, "step": 0.1}),
-            },
-            "optional": {
-                "details": ("SIGMAS", ),
-            }
-        }
-    RETURN_TYPES = ("LATENT",)
-    FUNCTION = "create_noisy_latents_perlin"
-    CATEGORY = "latent/noise"
-
-    # found at https://gist.github.com/vadimkantorov/ac1b097753f217c5c11bc2ff396e0a57
-    # which was ported from https://github.com/pvigier/perlin-numpy/blob/master/perlin2d.py
-    def rand_perlin_2d(self, shape, res, fade = lambda t: 6*t**5 - 15*t**4 + 10*t**3):
-        delta = (res[0] / shape[0], res[1] / shape[1])
-        d = (shape[0] // res[0], shape[1] // res[1])
-        
-        grid = torch.stack(torch.meshgrid(torch.arange(0, res[0], delta[0]), torch.arange(0, res[1], delta[1])), dim = -1) % 1
-        angles = 2*math.pi*torch.rand(res[0]+1, res[1]+1)
-        gradients = torch.stack((torch.cos(angles), torch.sin(angles)), dim = -1)
-        
-        tile_grads = lambda slice1, slice2: gradients[slice1[0]:slice1[1], slice2[0]:slice2[1]].repeat_interleave(d[0], 0).repeat_interleave(d[1], 1)
-        dot = lambda grad, shift: (torch.stack((grid[:shape[0],:shape[1],0] + shift[0], grid[:shape[0],:shape[1], 1] + shift[1]  ), dim = -1) * grad[:shape[0], :shape[1]]).sum(dim = -1)
-        
-        n00 = dot(tile_grads([0, -1], [0, -1]), [0,  0])
-        n10 = dot(tile_grads([1, None], [0, -1]), [-1, 0])
-        n01 = dot(tile_grads([0, -1],[1, None]), [0, -1])
-        n11 = dot(tile_grads([1, None], [1, None]), [-1,-1])
-        t = fade(grid[:shape[0], :shape[1]])
-        return math.sqrt(2) * torch.lerp(torch.lerp(n00, n10, t[..., 0]), torch.lerp(n01, n11, t[..., 0]), t[..., 1])
-
-    def rand_perlin_2d_octaves(self, shape, res, octaves=1, persistence=0.5):
-        noise = torch.zeros(shape)
-        frequency = 1
-        amplitude = 1
-        for _ in range(octaves):
-            noise += amplitude * self.rand_perlin_2d(shape, (frequency*res[0], frequency*res[1]))
-            frequency *= 2
-            amplitude *= persistence
-        noise = torch.remainder(torch.abs(noise)*1000000,11)/11
-        # noise = (torch.sin(torch.remainder(noise*1000000,83))+1)/2
-        return noise
+    # Solve for t and s:
+    # t * d1d1 - s * d1d2 = r_d1
+    # t * d1d2 - s * d2d2 = r_d2
+    # Solve using determinants:
+    denom = d1d1 * d2d2 - d1d2 * d1d2
+    # Avoid division by zero
+    denom = torch.where(denom.abs() < eps, torch.full_like(denom, eps), denom)
+    t = (r_d1 * d2d2 - r_d2 * d1d2) / denom
+    s = (r_d1 * d1d2 - r_d2 * d1d1) / denom
     
-    def scale_tensor(self, x):
-        min_value = x.min()
-        max_value = x.max()
-        x = (x - min_value) / (max_value - min_value)
-        return x
+    point1 = a + t * d1
+    point2 = b + s * d2
+    # If they intersect exactly, point1 and point2 are identical.
+    # Otherwise, return the midpoint of the closest points.
+    return (point1 + point2) / 2
 
-    def create_noisy_latents_perlin(self, seed, width, height, batch_size, detail_level, details=None):
-        if details is None:
-             details = torch.full((10000,), detail_level)
+def slerp_direction(t: float, u0: torch.Tensor, u1: torch.Tensor, DOT_THRESHOLD=0.9995) -> torch.Tensor:
+    dot = (u0 * u1).sum(-1).clamp(-1.0, 1.0) #u0, u1 are unit vectors... should not be affected by clamp
+    if dot.item() > DOT_THRESHOLD: # u0, u1 nearly aligned, fallback to lerp
+        return torch.lerp(u0, u1, t)
+    theta_0     = torch.acos(dot)
+    sin_theta_0 = torch.sin(theta_0)
+    theta_t     = theta_0 * t
+    sin_theta_t = torch.sin(theta_t)
+    s0          = torch.sin(theta_0 - theta_t) / sin_theta_0
+    s1          = sin_theta_t / sin_theta_0
+    return s0 * u0 + s1 * u1
+
+def magnitude_aware_interpolation(t: float, v0: torch.Tensor, v1: torch.Tensor) -> torch.Tensor:
+
+    m0 = v0.norm(dim=-1, keepdim=True)
+    m1 = v1.norm(dim=-1, keepdim=True)
+
+    u0 = v0 / (m0 + 1e-8)
+    u1 = v1 / (m1 + 1e-8)
+    
+    u = slerp_direction(t, u0, u1)
+    
+    m = (1 - t) * m0 + t * m1 # tinerpolate magnitudes linearly
+    return m * u
+
+
+def slerp_tensor(val: torch.Tensor, low: torch.Tensor, high: torch.Tensor, dim=-3) -> torch.Tensor:
+    #dim = (2,3)
+    if low.ndim == 4 and low.shape[-3] > 1:
+        dim=-3
+    elif low.ndim == 5 and low.shape[-3] > 1:
+        dim=-4
+    elif low.ndim == 2:
+        dim=(-2,-1)
+        
+    if type(val) == float:
+        val = torch.Tensor([val]).expand_as(low).to(low.dtype).to(low.device)
+        
+    if val.shape != low.shape:
+        val = val.expand_as(low)
+        
+    low_norm = low / (torch.norm(low, dim=dim, keepdim=True))
+    high_norm = high / (torch.norm(high, dim=dim, keepdim=True))
+    
+    dot = (low_norm * high_norm).sum(dim=dim, keepdim=True).clamp(-1.0, 1.0)
+    
+    #near = ~(-0.9995 < dot < 0.9995) #dot > 0.9995 or dot < -0.9995
+    near = dot > 0.9995
+    opposite = dot < -0.9995
+
+    condition = torch.logical_or(near, opposite)
+    
+    omega = torch.acos(dot)
+    so = torch.sin(omega)
+
+    if val.ndim < low.ndim:
+        val = val.unsqueeze(dim)
+    
+    factor_low = torch.sin((1 - val) * omega) / so
+    factor_high = torch.sin(val * omega) / so
+
+    res = factor_low * low + factor_high * high
+    res = torch.where(condition, low * (1 - val) + high * val, res)
+    return res
+
+
+
+
+# pytorch slerp implementation from https://gist.github.com/Birch-san/230ac46f99ec411ed5907b0a3d728efa
+from torch import FloatTensor, LongTensor, Tensor, Size, lerp, zeros_like
+from torch.linalg import norm
+
+# adapted to PyTorch from:
+# https://gist.github.com/dvschultz/3af50c40df002da3b751efab1daddf2c
+# most of the extra complexity is to support:
+# - many-dimensional vectors
+# - v0 or v1 with last dim all zeroes, or v0 ~colinear with v1
+#   - falls back to lerp()
+#   - conditional logic implemented with parallelism rather than Python loops
+# - many-dimensional tensor for t
+#   - you can ask for batches of slerp outputs by making t more-dimensional than the vectors
+#   -   slerp(
+#         v0:   torch.Size([2,3]),
+#         v1:   torch.Size([2,3]),
+#         t:  torch.Size([4,1,1]), 
+#       )
+#   - this makes it interface-compatible with lerp()
+
+def slerp(v0: FloatTensor, v1: FloatTensor, t: float|FloatTensor, DOT_THRESHOLD=0.9995):
+    '''
+    Spherical linear interpolation
+    Args:
+        v0: Starting vector
+        v1: Final vector
+        t: Float value between 0.0 and 1.0
+        DOT_THRESHOLD: Threshold for considering the two vectors as
+        colinear. Not recommended to alter this.
+    Returns:
+        Interpolation vector between v0 and v1
+    '''
+    assert v0.shape == v1.shape, "shapes of v0 and v1 must match"
+    
+    # Normalize the vectors to get the directions and angles
+    v0_norm: FloatTensor = norm(v0, dim=-1)
+    v1_norm: FloatTensor = norm(v1, dim=-1)
+    
+    v0_normed: FloatTensor = v0 / v0_norm.unsqueeze(-1)
+    v1_normed: FloatTensor = v1 / v1_norm.unsqueeze(-1)
+    
+    # Dot product with the normalized vectors
+    dot: FloatTensor = (v0_normed * v1_normed).sum(-1)
+    dot_mag: FloatTensor = dot.abs()
+    
+    # if dp is NaN, it's because the v0 or v1 row was filled with 0s
+    # If absolute value of dot product is almost 1, vectors are ~colinear, so use lerp
+    gotta_lerp: LongTensor = dot_mag.isnan() | (dot_mag > DOT_THRESHOLD)
+    can_slerp: LongTensor = ~gotta_lerp
+    
+    t_batch_dim_count: int = max(0, t.ndim-v0.ndim) if isinstance(t, Tensor) else 0
+    t_batch_dims: Size = t.shape[:t_batch_dim_count] if isinstance(t, Tensor) else Size([])
+    out: FloatTensor = zeros_like(v0.expand(*t_batch_dims, *[-1]*v0.ndim))
+    
+    # if no elements are lerpable, our vectors become 0-dimensional, preventing broadcasting
+    if gotta_lerp.any():
+        lerped: FloatTensor = lerp(v0, v1, t)
+    
+        out: FloatTensor = lerped.where(gotta_lerp.unsqueeze(-1), out)
+    
+    # if no elements are slerpable, our vectors become 0-dimensional, preventing broadcasting
+    if can_slerp.any():
+    
+        # Calculate initial angle between v0 and v1
+        theta_0: FloatTensor = dot.arccos().unsqueeze(-1)
+        sin_theta_0: FloatTensor = theta_0.sin()
+        # Angle at timestep t
+        theta_t: FloatTensor = theta_0 * t
+        sin_theta_t: FloatTensor = theta_t.sin()
+        # Finish the slerp algorithm
+        s0: FloatTensor = (theta_0 - theta_t).sin() / sin_theta_0
+        s1: FloatTensor = sin_theta_t / sin_theta_0
+        slerped: FloatTensor = s0 * v0 + s1 * v1
+    
+        out: FloatTensor = slerped.where(can_slerp.unsqueeze(-1), out)
+    
+    return out
+
+
+
+# this is silly...
+def normalize_latent(target, source=None, mean=True, std=True, set_mean=None, set_std=None, channelwise=True):
+    target = target.clone()
+    source = source.clone() if source is not None else None
+    def normalize_single_latent(single_target, single_source=None):
+        y = torch.zeros_like(single_target)
+        for b in range(y.shape[0]):
+            if channelwise:
+                for c in range(y.shape[1]):
+                    single_source_mean = single_source[b][c].mean() if set_mean is None else set_mean
+                    single_source_std  = single_source[b][c].std()  if set_std  is None else set_std
+                    
+                    if mean and std:
+                        y[b][c] = (single_target[b][c] - single_target[b][c].mean()) / single_target[b][c].std()
+                        if single_source is not None:
+                            y[b][c] = y[b][c] * single_source_std + single_source_mean
+                    elif mean:
+                        y[b][c] = single_target[b][c] - single_target[b][c].mean()
+                        if single_source is not None:
+                            y[b][c] = y[b][c] + single_source_mean
+                    elif std:
+                        y[b][c] = single_target[b][c] / single_target[b][c].std()
+                        if single_source is not None:
+                            y[b][c] = y[b][c] * single_source_std
+            else:
+                single_source_mean = single_source[b].mean() if set_mean is None else set_mean
+                single_source_std  = single_source[b].std()  if set_std  is None else set_std
+                
+                if mean and std:
+                    y[b] = (single_target[b] - single_target[b].mean()) / single_target[b].std()
+                    if single_source is not None:
+                        y[b] = y[b] * single_source_std + single_source_mean
+                elif mean:
+                    y[b] = single_target[b] - single_target[b].mean()
+                    if single_source is not None:
+                        y[b] = y[b] + single_source_mean
+                elif std:
+                    y[b] = single_target[b] / single_target[b].std()
+                    if single_source is not None:
+                        y[b] = y[b] * single_source_std
+        return y
+
+    if isinstance(target, (list, tuple)):
+        if source is not None:
+            assert isinstance(source, (list, tuple)) and len(source) == len(target), \
+                "If target is a list/tuple, source must be a list/tuple of the same length."
+            return [normalize_single_latent(t, s) for t, s in zip(target, source)]
         else:
-            details = detail_level * details
-        torch.manual_seed(seed)
-        noise = torch.zeros((batch_size, 4, height // 8, width // 8), dtype=torch.float32, device="cpu").cpu()
-        for i in range(batch_size):
-            for j in range(4):
-                noise_values = self.rand_perlin_2d_octaves((height // 8, width // 8), (1,1), 1, 1)
-                result = (1+details[i]/10)*torch.erfinv(2 * noise_values - 1) * (2 ** 0.5)
-                result = torch.clamp(result,-5,5)
-                noise[i, j, :, :] = result
-        return ({"samples": noise},)
+            return [normalize_single_latent(t) for t in target]
+    else:
+        return normalize_single_latent(target, source)
 
 
-class LatentNoiseBatch_gaussian_channels:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "latent": ("LATENT",),
-                "mean": ("FLOAT", {"default": 0.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "mean_luminosity": ("FLOAT", {"default": 0.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "mean_cyan_red": ("FLOAT", {"default": 0.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "mean_lime_purple": ("FLOAT", {"default": 0.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "mean_pattern_structure": ("FLOAT", {"default": 0.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "std": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "steps": ("INT", {"default": 0, "min": -10000, "max": 10000}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-            },
-            "optional": {
-                "means": ("SIGMAS", ),
-                "mean_luminositys": ("SIGMAS", ),
-                "mean_cyan_reds": ("SIGMAS", ),
-                "mean_lime_purples": ("SIGMAS", ),
-                "mean_pattern_structures": ("SIGMAS", ),
-                "stds": ("SIGMAS", ),
-            }
-        }
 
-    RETURN_TYPES = ("LATENT",)
-    FUNCTION = "main"
-
-    CATEGORY = "sampling/custom_sampling/samplers"
-
-    """    @staticmethod
-    def gaussian_noise_channels_like(x, mean=0.0, mean_luminosity = -0.1, mean_cyan_red = 0.0, mean_lime_purple=0.0, mean_pattern_structure=0.0, std_dev=1.0, seed=42):
-        x = x.squeeze(0)
-
-        noise = torch.randn_like(x) * std_dev + mean
-
-        luminosity = noise[0:1] + mean_luminosity
-        cyan_red = noise[1:2] + mean_cyan_red
-        lime_purple = noise[2:3] + mean_lime_purple
-        pattern_structure = noise[3:4] + mean_pattern_structure
-
-        noise = torch.unsqueeze(torch.cat([luminosity, cyan_red, lime_purple, pattern_structure]), 0)
-
-        return noise.to(x.device)"""
+def hard_light_blend(base_latent, blend_latent):
+    if base_latent.sum() == 0 and base_latent.std() == 0:
+        return base_latent
     
-    @staticmethod
-    def gaussian_noise_channels(x, mean_luminosity = -0.1, mean_cyan_red = 0.0, mean_lime_purple=0.0, mean_pattern_structure=0.0):
-        x = x.squeeze(0)
+    blend_latent = (blend_latent - blend_latent.min()) / (blend_latent.max() - blend_latent.min())
 
-        luminosity = x[0:1] + mean_luminosity
-        cyan_red = x[1:2] + mean_cyan_red
-        lime_purple = x[2:3] + mean_lime_purple
-        pattern_structure = x[3:4] + mean_pattern_structure
-
-        x = torch.unsqueeze(torch.cat([luminosity, cyan_red, lime_purple, pattern_structure]), 0)
-
-        return x
-
-    def main(self, latent, steps, seed, 
-              mean, mean_luminosity, mean_cyan_red, mean_lime_purple, mean_pattern_structure, std,
-              means=None, mean_luminositys=None, mean_cyan_reds=None, mean_lime_purples=None, mean_pattern_structures=None, stds=None):
-        if steps == 0:
-            steps = len(means)
-
-        x = latent["samples"]
-        b, c, h, w = x.shape  
-        # x_noised = torch.zeros([steps, 4, h, w], device=x.device)
-
-        noise_latents = torch.zeros([steps, 4, h, w], dtype=x.dtype, layout=x.layout, device=x.device)
-
-        noise_sampler = NOISE_GENERATOR_CLASSES.get('gaussian')(x=x, seed = seed)
-
-        means = initialize_or_scale(means, mean, steps)
-        mean_luminositys = initialize_or_scale(mean_luminositys, mean_luminosity, steps)
-        mean_cyan_reds = initialize_or_scale(mean_cyan_reds, mean_cyan_red, steps)
-        mean_lime_purples = initialize_or_scale(mean_lime_purples, mean_lime_purple, steps)
-        mean_pattern_structures = initialize_or_scale(mean_pattern_structures, mean_pattern_structure, steps)
-
-        stds = initialize_or_scale(stds, std, steps)
-
-        for i in range(steps):
-            noise = noise_sampler(mean=means[i].item(), std=stds[i].item())
-            noise = self.gaussian_noise_channels(noise, mean_luminositys[i].item(), mean_cyan_reds[i].item(), mean_lime_purples[i].item(), mean_pattern_structures[i].item())
-            noise_latents[i] = x + noise
-
-        return ({"samples": noise_latents}, )
-
-class LatentNoiseBatch_gaussian:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "latent": ("LATENT",),
-                "mean": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "std": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "steps": ("INT", {"default": 0, "min": -10000, "max": 10000}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-            },
-            "optional": {
-                "means": ("SIGMAS", ),
-                "stds": ("SIGMAS", ),
-            }
-        }
-
-    RETURN_TYPES = ("LATENT",)
-    FUNCTION = "main"
-
-    CATEGORY = "sampling/custom_sampling/samplers"
-
-    def main(self, latent, mean, std, steps, seed, means=None, stds=None):
-        if steps == 0:
-            steps = len(means)
-
-        means = initialize_or_scale(means, mean, steps)
-        stds = initialize_or_scale(stds, std, steps)    
-
-        latent_samples = latent["samples"]
-        b, c, h, w = latent_samples.shape  
-        #noise_latents = torch.zeros([steps, 4, h, w], device=latent_samples.device)
-
-        #for i in range(steps):
-        #    noise = self.adjustable_gaussian_noise_like(latent_samples, means[i].item(), stds[i].item(), seed+i)
-        #    noise_latents[i] = latent_samples + noise
-
-        noise_latents = torch.zeros([steps, 4, h, w], dtype=latent_samples.dtype, layout=latent_samples.layout, device=latent_samples.device)
-
-        noise_sampler = NOISE_GENERATOR_CLASSES.get('gaussian')(x=latent_samples, seed = seed)
-
-        for i in range(steps):
-            noise = noise_sampler(mean=means[i].item(), std=stds[i].item())
-            noise_latents[i] = latent_samples + noise
-
-        return ({"samples": noise_latents}, )
-
-class LatentNoiseBatch_fractal:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "latent": ("LATENT",),
-                "alpha": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "k_flip": ("BOOLEAN", {"default": False}),
-                "steps": ("INT", {"default": 0, "min": -10000, "max": 10000}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-            },
-            "optional": {
-                "alphas": ("SIGMAS", ),
-                "ks": ("SIGMAS", ),
-            }
-        }
-
-    RETURN_TYPES = ("LATENT",)
-    FUNCTION = "main"
-
-    CATEGORY = "sampling/custom_sampling/samplers"
-
-    def main(self, latent, alpha, k_flip, steps, seed=42, alphas=None, ks=None):
-        if steps == 0:
-            steps = len(alphas)
-
-        alphas = initialize_or_scale(alphas, alpha, steps)
-        k_flip = -1 if k_flip else 1
-        ks = initialize_or_scale(ks, k_flip, steps)
-
-        latent_samples = latent["samples"]
-        b, c, h, w = latent_samples.shape  
-        noise_latents = torch.zeros([steps, 4, h, w], dtype=latent_samples.dtype, layout=latent_samples.layout, device=latent_samples.device)
-
-        noise_sampler = NOISE_GENERATOR_CLASSES.get('fractal')(x=latent_samples, seed = seed)
-
-        for i in range(steps):
-            noise = noise_sampler(alpha=alphas[i].item(), k=ks[i].item(), scale=0.1)
-            noise_latents[i] = latent_samples + noise
-
-        return ({"samples": noise_latents}, )
-
-class LatentNoiseList:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "latent": ("LATENT",),
-                "alpha": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.001}),
-                "k_flip": ("BOOLEAN", {"default": False}),
-                "steps": ("INT", {"default": 0, "min": -10000, "max": 10000}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-            },
-            "optional": {
-                "alphas": ("SIGMAS", ),
-                "ks": ("SIGMAS", ),
-            }
-        }
-
-    RETURN_TYPES = ("LATENT",)
-    OUTPUT_IS_LIST = (True,)
-    FUNCTION = "main"
-
-    CATEGORY = "sampling/custom_sampling/samplers"
-
-    def main(self, seed, latent, alpha, k_flip, steps, alphas=None, ks=None):
-        alphas = initialize_or_scale(alphas, alpha, steps)
-        k_flip = -1 if k_flip else 1
-        ks = initialize_or_scale(ks, k_flip, steps)    
-
-        latent_samples = latent["samples"]
-        latents = []
-        size = latent_samples.shape
-
-        steps = len(alphas) if steps == 0 else steps
-
-        noise_sampler = NOISE_GENERATOR_CLASSES.get('fractal')(x=latent_samples, seed=seed)
-
-        for i in range(steps):
-            noise = noise_sampler(alpha=alphas[i].item(), k=ks[i].item(), scale=0.1)
-            noisy_latent = latent_samples + noise
-            new_latent = {"samples": noisy_latent}
-            latents.append(new_latent)
-
-        return (latents, )
+    positive_mask = base_latent >= 0
+    negative_mask = base_latent < 0
     
-class LatentBatch_channels:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "latent": ("LATENT",),
-                "mode": (["offset", "multiply", "power"],),
-                "luminosity": ("FLOAT", {"default": 0.0, "min": -10000.0, "max": 10000.0, "step": 0.01}),
-                "cyan_red": ("FLOAT", {"default": 0.0, "min": -10000.0, "max": 10000.0, "step": 0.01}),
-                "lime_purple": ("FLOAT", {"default": 0.0, "min": -10000.0, "max": 10000.0, "step": 0.01}),
-                "pattern_structure": ("FLOAT", {"default": 0.0, "min": -10000.0, "max": 10000.0, "step": 0.01}),
-            },
-            "optional": {
-                "luminositys": ("SIGMAS", ),
-                "cyan_reds": ("SIGMAS", ),
-                "lime_purples": ("SIGMAS", ),
-                "pattern_structures": ("SIGMAS", ),
-            }
-        }
+    positive_latent = base_latent * positive_mask.float()
+    negative_latent = base_latent * negative_mask.float()
 
-    RETURN_TYPES = ("LATENT",)
-    FUNCTION = "main"
+    positive_result = torch.where(blend_latent < 0.5,
+                                  2 * positive_latent * blend_latent,
+                                  1 - 2 * (1 - positive_latent) * (1 - blend_latent))
 
-    CATEGORY = "sampling/custom_sampling/samplers"
+    negative_result = torch.where(blend_latent < 0.5,
+                                  2 * negative_latent.abs() * blend_latent,
+                                  1 - 2 * (1 - negative_latent.abs()) * (1 - blend_latent))
     
-    @staticmethod
-    def latent_channels_multiply(x, luminosity = -0.1, cyan_red = 0.0, lime_purple=0.0, pattern_structure=0.0):
-        luminosity = x[0:1] * luminosity
-        cyan_red = x[1:2] * cyan_red
-        lime_purple = x[2:3] * lime_purple
-        pattern_structure = x[3:4] * pattern_structure
+    negative_result = -negative_result
 
-        x = torch.unsqueeze(torch.cat([luminosity, cyan_red, lime_purple, pattern_structure]), 0)
-        return x
+    combined_result = positive_result * positive_mask.float() + negative_result * negative_mask.float()
 
-    @staticmethod
-    def latent_channels_offset(x, luminosity = -0.1, cyan_red = 0.0, lime_purple=0.0, pattern_structure=0.0):
-        luminosity = x[0:1] + luminosity
-        cyan_red = x[1:2] + cyan_red
-        lime_purple = x[2:3] + lime_purple
-        pattern_structure = x[3:4] + pattern_structure
-
-        x = torch.unsqueeze(torch.cat([luminosity, cyan_red, lime_purple, pattern_structure]), 0)
-        return x
+    #combined_result *= base_latent.max()
     
-    @staticmethod
-    def latent_channels_power(x, luminosity = -0.1, cyan_red = 0.0, lime_purple=0.0, pattern_structure=0.0):
-        luminosity = x[0:1] ** luminosity
-        cyan_red = x[1:2] ** cyan_red
-        lime_purple = x[2:3] ** lime_purple
-        pattern_structure = x[3:4] ** pattern_structure
-
-        x = torch.unsqueeze(torch.cat([luminosity, cyan_red, lime_purple, pattern_structure]), 0)
-        return x
-
-    def main(self, latent, mode,
-              luminosity, cyan_red, lime_purple, pattern_structure, 
-              luminositys=None, cyan_reds=None, lime_purples=None, pattern_structures=None):
-        
-        #pdb.set_trace()
-        x = latent["samples"]
-        b, c, h, w = x.shape  
-
-        # x_noised = torch.zeros([steps, 4, h, w], device=x.device)
-
-        noise_latents = torch.zeros([b, c, h, w], dtype=x.dtype, layout=x.layout, device=x.device)
-
-        luminositys = initialize_or_scale(luminositys, luminosity, b)
-        cyan_reds = initialize_or_scale(cyan_reds, cyan_red, b)
-        lime_purples = initialize_or_scale(lime_purples, lime_purple, b)
-        pattern_structures = initialize_or_scale(pattern_structures, pattern_structure, b)
-
-        for i in range(b):
-            if mode == "offset":
-                noise = self.latent_channels_offset(x[i], luminositys[i].item(), cyan_reds[i].item(), lime_purples[i].item(), pattern_structures[i].item())
-            elif mode == "multiply":  
-                noise = self.latent_channels_multiply(x[i], luminositys[i].item(), cyan_reds[i].item(), lime_purples[i].item(), pattern_structures[i].item())
-            elif mode == "power":  
-                noise = self.latent_channels_power(x[i], luminositys[i].item(), cyan_reds[i].item(), lime_purples[i].item(), pattern_structures[i].item())
-            noise_latents[i] = noise
-
-        return ({"samples": noise_latents}, )
+    ks  = combined_result
+    ks2 = torch.zeros_like(base_latent)
+    for n in range(base_latent.shape[1]):
+        ks2[0][n] = (ks[0][n]) / ks[0][n].std()
+        ks2[0][n] = (ks2[0][n] * base_latent[0][n].std())
+    combined_result = ks2
     
+    return combined_result
+
+
+
+
+def make_checkerboard(tile_size: int, num_tiles: int, dtype=torch.float16, device="cpu"):
+    pattern = torch.tensor([[0, 1], [1, 0]], dtype=dtype, device=device)
+    board = pattern.repeat(num_tiles // 2 + 1, num_tiles // 2 + 1)[:num_tiles, :num_tiles]
+    board_expanded = board.repeat_interleave(tile_size, dim=0).repeat_interleave(tile_size, dim=1)
+    return board_expanded
+
+
+
+def get_edge_mask_slug(mask: torch.Tensor, dilation: int = 3) -> torch.Tensor:
+
+    mask = mask.float()
+    
+    eroded = -F.max_pool2d(-mask.unsqueeze(0).unsqueeze(0), kernel_size=3, stride=1, padding=1)
+    eroded = eroded.squeeze(0).squeeze(0)
+    
+    edge = mask - eroded
+    edge = (edge > 0).float()
+    
+    dilated_edge = F.max_pool2d(edge.unsqueeze(0).unsqueeze(0), kernel_size=dilation, stride=1, padding=dilation//2)
+    dilated_edge = dilated_edge.squeeze(0).squeeze(0)
+    
+    return dilated_edge
+
+
+
+def get_edge_mask(mask: torch.Tensor, dilation: int = 3) -> torch.Tensor:
+    if dilation == 0:                                                         # safeguard for zero kernel size...
+        return mask
+    mask_tmp = mask.squeeze().to('cuda')
+    mask_tmp = mask_tmp.float()
+    
+    eroded = -F.max_pool2d(-mask_tmp.unsqueeze(0).unsqueeze(0), kernel_size=3, stride=1, padding=1)
+    eroded = eroded.squeeze(0).squeeze(0)
+    
+    edge = mask_tmp - eroded
+    edge = (edge > 0).float()
+    
+    dilated_edge = F.max_pool2d(edge.unsqueeze(0).unsqueeze(0), kernel_size=dilation, stride=1, padding=dilation//2)
+    dilated_edge = dilated_edge.squeeze(0).squeeze(0)
+    
+    return dilated_edge[...,:mask.shape[-2], :mask.shape[-1]].view_as(mask).to(mask.device)
+
+
+
+def checkerboard_variable(widths, dtype=torch.float16, device='cpu'):
+    total = sum(widths)
+    mask = torch.zeros((total, total), dtype=dtype, device=device)
+
+    x_start = 0
+    for i, w_x in enumerate(widths):
+        y_start = 0
+        for j, w_y in enumerate(widths):
+            if (i + j) % 2 == 0:  # checkerboard logic
+                mask[x_start:x_start+w_x, y_start:y_start+w_y] = 1.0
+            y_start += w_y
+        x_start += w_x
+
+    return mask
+
+
+
+
+
+def interpolate_spd(cov1, cov2, t, eps=1e-5):
+    """
+    Geodesic interpolation on the SPD manifold between cov1 and cov2.
+
+    Args:
+      cov1, cov2: [D×D] symmetric positive-definite covariances (torch.Tensor).
+      t:         interpolation factor in [0,1].
+      eps:       jitter added to diagonal for numerical stability.
+
+    Returns:
+      cov_t:     the SPD matrix at fraction t along the geodesic from cov1 to cov2.
+    """
+    cov1 = cov1.double()
+    cov2 = cov2.double()
+
+    M1 = cov1.clone()
+    M1.diagonal().add_(eps)
+    M2 = cov2.clone()
+    M2.diagonal().add_(eps)
+
+    S1, U1 = torch.linalg.eigh(M1)
+    S1_clamped = S1.clamp(min=eps)
+    inv_sqrt_S1 = S1_clamped.rsqrt()
+    M1_inv_sqrt = U1 @ torch.diag(inv_sqrt_S1) @ U1.T
+
+    middle = M1_inv_sqrt @ M2 @ M1_inv_sqrt
+
+    Sm, Um = torch.linalg.eigh(middle)
+    Sm_clamped = Sm.clamp(min=eps)
+
+    Sm_t = Sm_clamped.pow(t)
+
+    middle_t = Um @ torch.diag(Sm_t) @ Um.T
+
+    sqrt_S1 = S1_clamped.sqrt()
+    M1_sqrt = U1 @ torch.diag(sqrt_S1) @ U1.T
+
+    cov_t = M1_sqrt @ middle_t @ M1_sqrt
+
+    return cov_t.to(cov1.dtype) 
+
+
+
+
+
+def tile_latent(latent: torch.Tensor,
+                tile_size: Tuple[int,int]
+                ) -> Tuple[torch.Tensor,
+                           Tuple[int,...],
+                           Tuple[int,int],
+                           Tuple[List[int],List[int]]]:
+    """
+    Split `latent` into spatial tiles of shape (t_h, t_w).
+    Works on either:
+       - 4D [B,C,H,W]
+       - 5D [B,C,T,H,W]
+    Returns:
+        tiles:      [B*rows*cols, C, (T,), t_h, t_w]
+        orig_shape: the full shape of `latent`
+        tile_hw:    (t_h, t_w)
+        positions:  (pos_h, pos_w) lists of start y and x positions
+    """
+    *lead, H, W = latent.shape
+    B, C = lead[0], lead[1]
+    has_time = (latent.ndim == 5)
+    if has_time:
+        T = lead[2]
+    t_h, t_w = tile_size
+
+    rows = (H + t_h - 1) // t_h
+    cols = (W + t_w - 1) // t_w
+
+    if rows == 1:
+        pos_h = [0]
+    else:
+        pos_h = [round(i*(H - t_h)/(rows-1)) for i in range(rows)]
+    if cols == 1:
+        pos_w = [0]
+    else:
+        pos_w = [round(j*(W - t_w)/(cols-1)) for j in range(cols)]
+
+    tiles = []
+    for y in pos_h:
+        for x in pos_w:
+            if has_time:
+                tile = latent[:, :, :, y:y+t_h, x:x+t_w]
+            else:
+                tile = latent[:, :,    y:y+t_h, x:x+t_w]
+            tiles.append(tile)
+
+    tiles = torch.cat(tiles, dim=0)
+    orig_shape = tuple(latent.shape)
+    return tiles, orig_shape, (t_h, t_w), (pos_h, pos_w)
+
+
+def untile_latent(tiles: torch.Tensor,
+                  orig_shape: Tuple[int,...],
+                  tile_hw: Tuple[int,int],
+                  positions: Tuple[List[int],List[int]]
+                  ) -> torch.Tensor:
+    """
+    Reconstruct latent from tiles + their start positions.
+    Works on either 4D or 5D original.
+    Args:
+      tiles:      [B*rows*cols, C, (T,), t_h, t_w]
+      orig_shape: shape of original latent (B,C,H,W) or (B,C,T,H,W)
+      tile_hw:    (t_h, t_w)
+      positions:  (pos_h, pos_w)
+    Returns:
+      reconstructed latent of shape `orig_shape`
+    """
+    *lead, H, W = orig_shape
+    B, C = lead[0], lead[1]
+    has_time = (len(orig_shape) == 5)
+    if has_time:
+        T = lead[2]
+    t_h, t_w = tile_hw
+    pos_h, pos_w = positions
+    rows, cols = len(pos_h), len(pos_w)
+
+    if has_time:
+        out = torch.zeros(B, C, T, H, W, device=tiles.device, dtype=tiles.dtype)
+        count = torch.zeros_like(out)
+        tiles = tiles.view(B, rows, cols, C, T, t_h, t_w)
+        for bi in range(B):
+            for i, y in enumerate(pos_h):
+                for j, x in enumerate(pos_w):
+                    tile = tiles[bi, i, j]
+                    out[bi, :, :, y:y+t_h, x:x+t_w] += tile
+                    count[bi, :, :, y:y+t_h, x:x+t_w] += 1
+    else:
+        out = torch.zeros(B, C, H, W, device=tiles.device, dtype=tiles.dtype)
+        count = torch.zeros_like(out)
+        tiles = tiles.view(B, rows, cols, C, t_h, t_w)
+        for bi in range(B):
+            for i, y in enumerate(pos_h):
+                for j, x in enumerate(pos_w):
+                    tile = tiles[bi, i, j]
+                    out[bi, :, y:y+t_h, x:x+t_w] += tile
+                    count[bi, :, y:y+t_h, x:x+t_w] += 1
+
+    valid = count > 0
+    out[valid] = out[valid] / count[valid]
+    return out
+
+
+
+def upscale_to_match_spatial(tensor_5d, ref_4d, mode='bicubic'):
+    """
+    Upscales a 5D tensor [B, C, T, H1, W1] to match the spatial size of a 4D tensor [1, C, H2, W2].
+    
+    Args:
+        tensor_5d: Tensor of shape [B, C, T, H1, W1]
+        ref_4d: Tensor of shape [1, C, H2, W2] — used as spatial reference
+        mode: Interpolation mode ('bilinear' or 'bicubic')
+    
+    Returns:
+        Resized tensor of shape [B, C, T, H2, W2]
+    """
+    b, c, t, _, _ = tensor_5d.shape
+    _, _, h_target, w_target = ref_4d.shape
+
+    tensor_reshaped = tensor_5d.reshape(b * c, t, tensor_5d.shape[-2], tensor_5d.shape[-1])
+    upscaled = F.interpolate(tensor_reshaped, size=(h_target, w_target), mode=mode, align_corners=False)
+    return upscaled.view(b, c, t, h_target, w_target)
+
+
+
+
+
+def gaussian_blur_2d(img: torch.Tensor, sigma: float, kernel_size: int = None) -> torch.Tensor:
+    B, C, H, W = img.shape
+    dtype = img.dtype
+    device = img.device
+
+    if kernel_size is None:
+        kernel_size = int(2 * math.ceil(3 * sigma) + 1)
+
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+
+    coords = torch.arange(kernel_size, dtype=torch.float64) - kernel_size // 2
+    g = torch.exp(-0.5 * (coords / sigma) ** 2)
+    g = g / g.sum()
+
+    kernel_2d = g[:, None] * g[None, :]
+    kernel_2d = kernel_2d.to(dtype=dtype, device=device)
+
+    kernel = kernel_2d.expand(C, 1, kernel_size, kernel_size)
+
+    pad = kernel_size // 2
+    img_padded = F.pad(img, (pad, pad, pad, pad), mode='reflect')
+
+    return F.conv2d(img_padded, kernel, groups=C)
+
+
+def median_blur_2d(img: torch.Tensor, kernel_size: int = 3) -> torch.Tensor:
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    pad = kernel_size // 2
+
+    B, C, H, W = img.shape
+    img_padded = F.pad(img, (pad, pad, pad, pad), mode='reflect')
+
+    unfolded = img_padded.unfold(2, kernel_size, 1).unfold(3, kernel_size, 1)
+    # unfolded: [B, C, H, W, kH, kW] → flatten to patches
+    patches = unfolded.contiguous().view(B, C, H, W, -1)
+    median = patches.median(dim=-1).values
+    return median
+
